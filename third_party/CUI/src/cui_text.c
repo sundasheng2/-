@@ -503,15 +503,19 @@ cui_text_metrics cui_measure_text(cui_ctx *ui, cui_font font, float size, const 
     return m;
 }
 
-int cui__text_hit(cui_ctx *ui, cui_font font, float size, const char *text, int len, float x) {
+int cui__text_hit_ex(cui_ctx *ui, cui_font font, float size, const char *text, int len, float x, bool tabular) {
     font = cui__resolve_font(ui, font);
     if (font < 0 || x <= 0) return 0;
     cui__glyph_iter it;
-    cui__iter_init(&it, ui, font, size, text, len, false);
+    cui__iter_init(&it, ui, font, size, text, len, tabular);
     while (cui__iter_next(&it)) {
         if (x < it.gx + it.adv * 0.5f) return it.start;
     }
     return len;
+}
+
+int cui__text_hit(cui_ctx *ui, cui_font font, float size, const char *text, int len, float x) {
+    return cui__text_hit_ex(ui, font, size, text, len, x, false);
 }
 
 /* ---- word wrap ---- */

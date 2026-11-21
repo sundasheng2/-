@@ -169,6 +169,7 @@ float cui__font_ascent(cui_ctx *ui, cui_font font, float size);
 float cui__text_width(cui_ctx *ui, cui_font font, float size, const char *text, int len, bool tabular);
 /* Index of the byte boundary closest to x within a single line. */
 int cui__text_hit(cui_ctx *ui, cui_font font, float size, const char *text, int len, float x);
+int cui__text_hit_ex(cui_ctx *ui, cui_font font, float size, const char *text, int len, float x, bool tabular);
 /* Word wrap into lines. Returns line count; writes up to max lines. */
 int cui__text_wrap(cui_ctx *ui, cui_font font, float size, const char *text, int len, float width,
                    cui_text_layout_line *lines, int max_lines);

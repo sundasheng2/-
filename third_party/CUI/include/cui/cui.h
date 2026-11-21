@@ -3087,6 +3087,7 @@ typedef struct cui_log_view_opts {
     cui_font font;             /* default CUI_FONT_MONO when zero */
     bool no_level_column;      /* hide the per-line level label */
     cui_color info_color;      /* default text color for info rows, if set */
+    const char *copy_body_prefix;  /* only matching rows' text after this prefix can be selected and copied */
 } cui_log_view_opts;
 /* Toolbar: level filters, a search field that filters and highlights,
  * Follow (keeps the newest line in view; scrolling up turns it off, reaching

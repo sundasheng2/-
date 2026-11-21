@@ -565,6 +565,7 @@ static const cui_log_line *cui__log_at(const cui_log_buffer *b, uint64_t seq) {
 /* ======================================================================== */
 
 #define CUI__LOG_DRAW_MAX 1024   /* bytes of a line that are measured and drawn; copy gets them all */
+#define CUI__LOG_PAD_X 12.0f
 
 static const char *const cui__log_tags[CUI_LOG_LEVEL_COUNT] = { "跟踪", "调试", "信息", "警告", "错误" };
 
@@ -581,6 +582,7 @@ typedef struct {
     /* selection and keyboard cursor, as line numbers */
     bool has_sel, has_cursor;
     uint64_t anchor, cursor;
+    int anchor_byte, cursor_byte;   /* offsets in the full UTF-8 row, before clipping */
     float max_w, hover;
     cui_font font;
     float size;
@@ -663,6 +665,62 @@ static void cui__log_time(char *out, size_t cap, double t) {
     snprintf(out, cap, "%02u:%02u:%02u.%03u", (unsigned)((sec / 3600) % 24), (unsigned)((sec / 60) % 60), (unsigned)(sec % 60), (unsigned)(ms % 1000));
 }
 
+static int cui__logv_body_start(const char *prefix, const char *text, int len) {
+    size_t n = strlen(prefix);
+    return n <= (size_t)len && memcmp(prefix, text, n) == 0 ? (int)n : -1;
+}
+
+typedef struct {
+    uint64_t first, last;
+    int first_byte, last_byte;
+} cui__logv_range;
+
+static cui__logv_range cui__logv_selection(const cui__logv_state *s) {
+    if (s->anchor < s->cursor || (s->anchor == s->cursor && s->anchor_byte <= s->cursor_byte)) {
+        return (cui__logv_range){s->anchor, s->cursor, s->anchor_byte, s->cursor_byte};
+    }
+    return (cui__logv_range){s->cursor, s->anchor, s->cursor_byte, s->anchor_byte};
+}
+
+static void cui__logv_body_range(cui__logv_range sel, uint64_t seq, int body, int len, int *start, int *end) {
+    *start = seq == sel.first ? CUI_CLAMP(sel.first_byte, body, len) : body;
+    *end = seq == sel.last ? CUI_CLAMP(sel.last_byte, body, len) : len;
+}
+
+static void cui__logv_copy_body(cui_ctx *ui, const cui__logv_state *s, const cui_log_buffer *b,
+                                const char *prefix) {
+    if (!ui->platform.set_clipboard || s->nrows == 0) return;
+    cui__logv_range sel = cui__logv_selection(s);
+    int first = s->has_sel ? cui__logv_lower(s, sel.first) : 0;
+    int last = s->nrows;
+    size_t capacity = 1;
+    for (int i = first; i < last; i++) {
+        if (s->has_sel && s->rows[i] > sel.last) { last = i; break; }
+        const cui_log_line *line = cui__log_at(b, s->rows[i]);
+        if (line) capacity += line->len + 1;
+    }
+    char *out = cui__alloc(ui, capacity);
+    size_t used = 0;
+    bool copied = false;
+    for (int i = first; i < last; i++) {
+        uint64_t seq = s->rows[i];
+        const cui_log_line *line = cui__log_at(b, seq);
+        if (!line) continue;
+        const char *text = b->text + line->offset;
+        int len = (int)line->len;
+        int start = cui__logv_body_start(prefix, text, len), end = len;
+        if (start < 0) continue;
+        if (s->has_sel) cui__logv_body_range(sel, seq, start, len, &start, &end);
+        if (copied) out[used++] = '\n';
+        memcpy(out + used, text + start, (size_t)(end - start));
+        used += (size_t)(end - start);
+        copied = true;
+    }
+    out[used] = 0;
+    if (used > 0) ui->platform.set_clipboard(ui->platform.user, out);
+    cui__free(ui, out);
+}
+
 /* Copies the selected shown lines (or every shown line) as text. */
 static void cui__logv_copy(cui_ctx *ui, const cui__logv_state *s, const cui_log_buffer *b, bool timestamps) {
     if (!ui->platform.set_clipboard || s->nrows == 0) return;
@@ -715,6 +773,7 @@ typedef struct {
     char time[16];
     uint8_t level;
     bool selected, cursor;
+    int selection_begin, selection_end;
     float hover;
 } cui__logv_row;
 
@@ -759,6 +818,11 @@ static void cui__paint_log_row(cui_ctx *ui, cui_node *n, void *data) {
     if (!c->no_level_column) cui__draw_text_line(ui, c->font, c->size, r.x + c->x_tag, ty, c->tag[p->level], cui__log_tags[p->level], -1, true);
     float x = r.x + c->x_text;
     if (p->color_count && !p->selected) cui__paint_log_colors(ui, p, x, ty, fh, true);
+    if (p->selection_end > p->selection_begin) {
+        float left = cui__text_width(ui, c->font, c->size, p->text, p->selection_begin, true);
+        float right = cui__text_width(ui, c->font, c->size, p->text, p->selection_end, true);
+        cui_draw_rect(ui, (cui_rect){x + left, r.y + 2, right - left, r.h - 4}, CUI_CORNERS(0), c->sel);
+    }
     if (c->qn > 0) {
         /* every match gets a quiet mark behind it */
         int from = 0;
@@ -808,7 +872,7 @@ typedef struct {
     cui_id id, lid, sid;                /* the view, its list, its scroll area */
     cui__logv_state *s;
     cui_font font;
-    float size, row_h, pad_y;
+    float size, row_h, pad_y, x_tag, x_text;
     cui_scroll_state *ss;
     float view_h;
     bool copy_now;                      /* the copy button or Ctrl+C */
@@ -889,12 +953,30 @@ static void cui__lvf_build_toolbar(cui__lvf *f) {
     cui_box_end(ui);
 }
 
-/* the pointer on the list: a press selects a line (Shift extends), dragging extends */
+static int cui__lvf_hit_byte(cui__lvf *f, uint64_t seq, float x) {
+    const cui_log_line *line = cui__log_at(f->b, seq);
+    if (!line) return 0;
+    const char *text = f->b->text + line->offset;
+    int body = cui__logv_body_start(f->o->copy_body_prefix, text, (int)line->len);
+    if (body < 0) return 0;
+    int len = cui__utf8_cut(text, (int)line->len, CUI__LOG_DRAW_MAX);
+    int hit = cui__text_hit_ex(f->ui, f->font, f->size, text, len, x - f->x_text, true);
+    return CUI_MAX(body, hit);
+}
+
+static void cui__lvf_update_selection(cui__lvf *f) {
+    cui__logv_state *s = f->s;
+    s->has_sel = !f->o->copy_body_prefix || s->anchor != s->cursor || s->anchor_byte != s->cursor_byte;
+}
+
+/* A press starts a selection; Shift and dragging extend it. */
 static void cui__lvf_pointer(cui__lvf *f) {
     cui_ctx *ui = f->ui;
     cui__logv_state *s = f->s;
     f->lr = cui__interact(ui, f->lid, CUI_IF_FOCUSABLE | CUI_IF_DRAG);
     cui_rect cr = cui__prev_rect(ui, f->lid);
+    if (f->o->copy_body_prefix && f->lr.hovered && ui->mx >= cr.x + f->x_text)
+        cui__set_cursor(ui, CUI_CURSOR_TEXT);
     f->hover_row = -1;
     if (cr.h > 0 && (f->lr.hovered || f->lr.active)) {
         float fy = (ui->my - cr.y - f->pad_y) / f->row_h;
@@ -907,16 +989,23 @@ static void cui__lvf_pointer(cui__lvf *f) {
         if (f->lr.hovered && ui->mpressed[0]) {
             if (f->hover_row >= 0) {
                 uint64_t seq = s->rows[f->hover_row];
-                if ((ui->mods & CUI_MOD_SHIFT) && s->has_cursor) { if (!s->has_sel) s->anchor = s->cursor; }
-                else s->anchor = seq;
+                int byte = f->o->copy_body_prefix ? cui__lvf_hit_byte(f, seq, ui->mx - cr.x) : 0;
+                if (!((ui->mods & CUI_MOD_SHIFT) && s->has_cursor)) {
+                    s->anchor = seq; s->anchor_byte = byte;
+                } else if (!s->has_sel) {
+                    s->anchor = s->cursor; s->anchor_byte = s->cursor_byte;
+                }
                 s->cursor = seq;
-                s->has_sel = s->has_cursor = true;
+                s->cursor_byte = byte;
+                s->has_cursor = true;
+                cui__lvf_update_selection(f);
                 s->dragging = true;
             } else s->has_sel = false;
         }
-        if (s->dragging && f->lr.active && ui->mdown[0] && s->nrows > 0 && ri >= 0 && ri < s->nrows && s->rows[ri] != s->cursor) {
+        if (s->dragging && f->lr.active && (ui->mdown[0] || ui->mreleased[0]) && ri >= 0 && ri < s->nrows) {
             s->cursor = s->rows[ri];
-            s->has_sel = true;
+            s->cursor_byte = f->o->copy_body_prefix ? cui__lvf_hit_byte(f, s->cursor, ui->mx - cr.x) : 0;
+            cui__lvf_update_selection(f);
         }
     }
     if (!ui->mdown[0]) s->dragging = false;
@@ -944,10 +1033,14 @@ static void cui__lvf_keys(cui__lvf *f) {
     if (moved) {
         to = CUI_CLAMP(to, 0, s->nrows - 1);
         uint64_t prev = s->has_cursor ? s->cursor : s->rows[to];
+        int prev_byte = s->cursor_byte;
         s->cursor = s->rows[to];
-        if (ui->mods & CUI_MOD_SHIFT) { if (!s->has_sel) s->anchor = prev; }
-        else s->anchor = s->cursor;
-        s->has_sel = s->has_cursor = true;
+        s->cursor_byte = f->o->copy_body_prefix ? cui__lvf_hit_byte(f, s->cursor, f->x_text) : 0;
+        if (ui->mods & CUI_MOD_SHIFT) {
+            if (!s->has_sel) { s->anchor = prev; s->anchor_byte = prev_byte; }
+        } else { s->anchor = s->cursor; s->anchor_byte = s->cursor_byte; }
+        s->has_cursor = true;
+        cui__lvf_update_selection(f);
         if (to < s->nrows - 1) f->key_up = true;
         /* keep the cursor row in view */
         float top = pad_y + to * row_h, bottom = top + row_h;
@@ -958,9 +1051,13 @@ static void cui__lvf_keys(cui__lvf *f) {
     if ((ui->mods & CUI_MOD_PRIMARY) && cui_key_pressed(ui, CUI_KEY_A)) {
         s->anchor = s->rows[0];
         s->cursor = s->rows[s->nrows - 1];
+        s->anchor_byte = 0;
+        const cui_log_line *last = cui__log_at(f->b, s->cursor);
+        s->cursor_byte = last ? (int)last->len : 0;
         s->has_sel = s->has_cursor = true;
     }
-    if ((ui->mods & CUI_MOD_PRIMARY) && cui_key_pressed(ui, CUI_KEY_C)) f->copy_now = true;
+    if ((ui->mods & CUI_MOD_PRIMARY) && cui_key_pressed(ui, CUI_KEY_C) &&
+        (!f->o->copy_body_prefix || s->has_sel)) f->copy_now = true;
     if (cui_key_pressed(ui, CUI_KEY_ESCAPE) && s->has_sel) { s->has_sel = false; ui->kpressed[CUI_KEY_ESCAPE] = 0; }
 }
 
@@ -972,14 +1069,14 @@ static void cui__lvf_follow(cui__lvf *f, float total_h) {
     float max_y = CUI_MAX(0, ss->content_h - ss->view_h);
     if (s->follow && (f->wheel > 0 || f->key_up || (ss->drag_y && ss->ty < max_y - 1))) s->follow = false;
     else if (!s->follow && (f->wheel < 0 || ss->drag_y || f->key_end) && ss->ty >= max_y - 1) s->follow = true;
-    if (s->follow) {
+    if (s->follow && !(f->o->copy_body_prefix && s->dragging)) {
         float bottom = CUI_MAX(0, total_h - f->view_h);
         if (ss->ty != bottom) { ss->ty = bottom; f->ui->animating = true; }
     }
 }
 
 /* what every row's paint shares: the columns and the colors per level */
-static cui__logv_common *cui__lvf_common(cui__lvf *f, cui_color list_bg, float pad_x) {
+static cui__logv_common *cui__lvf_common(cui__lvf *f, cui_color list_bg) {
     cui_ctx *ui = f->ui;
     const cui_log_view_opts *o = f->o;
     float size = f->size;
@@ -987,15 +1084,10 @@ static cui__logv_common *cui__lvf_common(cui__lvf *f, cui_color list_bg, float p
     memset(c, 0, sizeof *c);
     c->font = f->font;
     c->size = size; c->row_h = f->row_h; c->timestamps = o->timestamps;
-    float time_w = cui__text_width(ui, c->font, size, "00:00:00.000", 12, true);
     c->no_level_column = o->no_level_column;
-    c->x_time = pad_x;
-    c->x_tag = o->timestamps ? pad_x + time_w + 14 : pad_x;
-    c->x_text = c->x_tag;
-    if (!c->no_level_column) {
-        float tag_w = cui__text_width(ui, c->font, size, "错误", -1, true);
-        c->x_text += tag_w + 14;
-    }
+    c->x_time = CUI__LOG_PAD_X;
+    c->x_tag = f->x_tag;
+    c->x_text = f->x_text;
     c->query = f->s->applied[0] ? cui__frame_strdup(ui, f->s->applied, -1) : NULL;
     c->qn = c->query ? (int)strlen(c->query) : 0;
     bool dark = ui->mode == CUI_THEME_DARK;
@@ -1028,7 +1120,7 @@ static void cui__lvf_build_rows(cui__lvf *f, cui__logv_common *c, int first, int
     const cui_log_buffer *b = f->b;
     float size = f->size;
     cui__leaf(ui, 0, CUI_FILL, CUI_PX(f->pad_y + first * f->row_h));
-    uint64_t sel_lo = CUI_MIN(s->anchor, s->cursor), sel_hi = CUI_MAX(s->anchor, s->cursor);
+    cui__logv_range sel = cui__logv_selection(s);
     bool show_cursor = ui->focus == f->lid && ui->focus_visible && s->has_cursor;
     for (int i = first; i < last; i++) {
         uint64_t seq = s->rows[i];
@@ -1051,7 +1143,12 @@ static void cui__lvf_build_rows(cui__lvf *f, cui__logv_common *c, int first, int
         p->more = (int)l->len - len;
         p->level = l->level;
         if (f->o->timestamps) cui__log_time(p->time, sizeof p->time, l->time);
-        p->selected = s->has_sel && seq >= sel_lo && seq <= sel_hi;
+        if (s->has_sel && seq >= sel.first && seq <= sel.last) {
+            if (f->o->copy_body_prefix) {
+                int body = cui__logv_body_start(f->o->copy_body_prefix, p->text, p->len);
+                if (body >= 0) cui__logv_body_range(sel, seq, body, p->len, &p->selection_begin, &p->selection_end);
+            } else p->selected = true;
+        }
         p->cursor = show_cursor && seq == s->cursor;
         p->hover = i == f->hover_row ? s->hover : 0;
         float w = cui__text_width(ui, c->font, size, p->text, len, true);
@@ -1089,8 +1186,7 @@ static int cui__lvf_build_list(cui__lvf *f) {
     if (first < 0) first = 0;
     if (last > s->nrows) last = s->nrows;
     if (first > last) first = last;
-    float pad_x = 12;
-    cui__logv_common *c = cui__lvf_common(f, list_bg, pad_x);
+    cui__logv_common *c = cui__lvf_common(f, list_bg);
 
     int content = cui__node_new(ui, f->lid);
     cui_node *cn = &ui->nodes[content];
@@ -1111,7 +1207,7 @@ static int cui__lvf_build_list(cui__lvf *f) {
         cui__lvf_build_rows(f, c, first, last);
     }
     cui__close(ui);   /* content */
-    ui->nodes[content].min_w = c->x_text + s->max_w + pad_x;
+    ui->nodes[content].min_w = c->x_text + s->max_w + CUI__LOG_PAD_X;
     cui__scroll_end_ex(ui);
     cui__close(ui);   /* frame */
     return frame;
@@ -1139,6 +1235,10 @@ static void cui__log_view_ex_body(cui_ctx *ui, const char *id_str, cui_log_buffe
     f.size = cui__fs(ui, o->size > 0 ? o->size : 12);
     f.row_h = roundf(f.size * 1.8f);
     f.pad_y = 6;
+    f.x_tag = CUI__LOG_PAD_X;
+    if (o->timestamps) f.x_tag += cui__text_width(ui, f.font, f.size, "00:00:00.000", 12, true) + 14;
+    f.x_text = f.x_tag;
+    if (!o->no_level_column) f.x_text += cui__text_width(ui, f.font, f.size, "错误", -1, true) + 14;
     cui_scroll_state *ss = f.ss = cui_state(ui, f.sid, sizeof *ss);
     if (s->font != f.font || s->size != f.size) {
         float previous_row_h = roundf(s->size * 1.8f);
@@ -1171,7 +1271,11 @@ static void cui__log_view_ex_body(cui_ctx *ui, const char *id_str, cui_log_buffe
     /* input on the list */
     cui__lvf_pointer(&f);
     if (ui->focus == f.lid && s->nrows > 0) cui__lvf_keys(&f);
-    if (f.copy_now) { cui__logv_copy(ui, s, f.b, o->timestamps); s->copied_at = ui->time; }
+    if (f.copy_now) {
+        if (o->copy_body_prefix) cui__logv_copy_body(ui, s, f.b, o->copy_body_prefix);
+        else cui__logv_copy(ui, s, f.b, o->timestamps);
+        s->copied_at = ui->time;
+    }
     cui__tween(ui, &s->hover, f.hover_row >= 0 && !f.lr.active ? 1.0f : 0.0f, CUI__T_HIGHLIGHT);
 
     int frame = cui__lvf_build_list(&f);

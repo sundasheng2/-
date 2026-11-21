@@ -52,6 +52,7 @@ typedef struct
     char baud_input[16];
     char tx_input[SERIAL_COMMAND_CAPACITY];
     char status[192];
+    char access_error[128];
     int data_bits_index;
     int parity_index;
     int stop_bits_index;
@@ -128,6 +129,7 @@ static void draw_new_session(cui_ctx *ui);
 static void draw_ssh_session(serial_session *current, cui_ctx *ui);
 static void stop_ssh_session(serial_session *current);
 static void draw_session(serial_session *current, cui_ctx *ui);
+static void draw_serial_access_error(const serial_session *current, cui_ctx *ui);
 static void draw_quick_commands(serial_session *current, cui_ctx *ui, bool connected);
 static void draw_command_editor(serial_session *current, cui_ctx *ui);
 static void open_command_editor(const serial_session *current, int index);
@@ -329,14 +331,21 @@ static void draw_workspace(cui_ctx *ui)
             snprintf(titles[i], sizeof titles[i], "会话 %d##会话%d", current->id, current->id);
         }
         bool recording = current->capture != NULL;
+        bool access_denied = current->access_error[0] != '\0';
+        const char *icon_tooltip = connected ? "已连接 · 点击断开" :
+                                   (current->port_index >= 0 ? "未连接 · 点击连接" : "点击选择串口");
+        if (access_denied)
+        {
+            /* 当前会话已有横幅，避免悬停提示挡住错误详情。 */
+            icon_tooltip = i == selected_tab ? NULL : "串口被占用或访问被拒绝 · 点击重试";
+        }
         items[i] = (cui_doc_tab){
             .title = titles[i],
-            .icon = recording ? CUI_ICON_CIRCLE_DOT :
-                                (connected ? CUI_ICON_CIRCLE_CHECK : CUI_ICON_CIRCLE),
+            .icon = access_denied ? CUI_ICON_CIRCLE_ALERT : (recording ? CUI_ICON_CIRCLE_DOT :
+                    (connected ? CUI_ICON_CIRCLE_CHECK : CUI_ICON_CIRCLE)),
             .icon_action = true,
             .icon_color = connected ? CUI_COLOR_SUCCESS : CUI_COLOR_DANGER,
-            .icon_tooltip = connected ? "已连接 · 点击断开" :
-                            (current->port_index >= 0 ? "未连接 · 点击连接" : "点击选择串口"),
+            .icon_tooltip = icon_tooltip,
             .tooltip = recording ? capture_label(current) :
                                    (connected ? "已连接 · 右键打开会话菜单" :
                                                 "未连接 · 右键打开会话菜单"),
@@ -399,6 +408,7 @@ static void draw_workspace(cui_ctx *ui)
         }
         else
         {
+            draw_serial_access_error(current, ui);
             draw_session(current, ui);
             draw_settings(current, ui);
             draw_command_editor(current, ui);
@@ -447,12 +457,6 @@ static void draw_session_menu(cui_ctx *ui, bool requested)
         {
             selected_tab = i;
             show_settings = true;
-        }
-        bool recording = target->capture != NULL;
-        if (cui_menu_item(ui, recording ? "停止记录" : "记录接收数据",
-                          .icon = recording ? CUI_ICON_SQUARE : CUI_ICON_CIRCLE_DOT))
-        {
-            toggle_capture(target);
         }
         break;
     }
@@ -617,6 +621,21 @@ static cui_font load_system_font(cui_ctx *ui, const char *directory, const char 
     return cui_font_load_file(ui, path);
 }
 
+static void draw_serial_access_error(const serial_session *current, cui_ctx *ui)
+{
+    if (current->access_error[0] == '\0')
+    {
+        return;
+    }
+    cui_color danger = cui_color_of(ui, CUI_COLOR_DANGER);
+    cui_row(ui, .width = CUI_FILL, .pad_x = 10, .pad_y = 6, .gap = 8, .radius = 7,
+            .bg = cui_alpha(danger, 0.13f), .border = 1, .border_color = cui_alpha(danger, 0.65f))
+    {
+        cui_text(ui, CUI_ICON_CIRCLE_ALERT, .font = CUI_FONT_ICONS, .color = danger);
+        cui_text(ui, current->access_error, .font = CUI_FONT_MEDIUM, .color = danger);
+    }
+}
+
 static void draw_session(serial_session *current, cui_ctx *ui)
 {
     const char *endings[] = {"无换行", "回车（CR）", "换行（LF）", "回车换行"};
@@ -638,6 +657,14 @@ static void draw_session(serial_session *current, cui_ctx *ui)
                 cui_text(ui, "串口日志", .font = CUI_FONT_MEDIUM, .size = 16, .nowrap = true);
                 cui_secondary(ui, text_view ? "文本" : "十六进制");
                 cui_spacer(ui);
+                bool recording = current->capture != NULL;
+                if (cui_button(ui, recording ? "停止记录" : "记录接收数据",
+                               .icon = recording ? CUI_ICON_SQUARE : CUI_ICON_CIRCLE_DOT,
+                               .size = CUI_SIZE_SM, .selected = recording,
+                               .tooltip = recording ? capture_label(current) : "将当前会话收到的数据保存到文件"))
+                {
+                    toggle_capture(current);
+                }
                 if (cui_button(ui, "日志工具", .icon = CUI_ICON_SEARCH, .size = CUI_SIZE_SM,
                                .selected = show_log_tools,
                                .tooltip = "搜索、筛选、滚动、复制和清空"))
@@ -649,6 +676,7 @@ static void draw_session(serial_session *current, cui_ctx *ui)
                          text_view ? &current->text_log : &current->hex_log,
                          .height = -1, .timestamps = true, .no_toolbar = !show_log_tools,
                          .no_level_column = true, .info_color = CUI_RGB(0x00ff00),
+                         .copy_body_prefix = "接收  ",
                          .size = (float)log_font_size, .font = log_fonts[log_font_index]);
         }
         cui_column(ui, .width = CUI_FILL, .pad_x = 12, .pad_y = 7, .gap = 6,
@@ -658,6 +686,9 @@ static void draw_session(serial_session *current, cui_ctx *ui)
             cui_separator(ui);
             cui_row(ui, .gap = 8, .width = CUI_FILL)
             {
+                bool can_send = connected && !serial_is_sending(&current->serial);
+                bool clicked = cui_button(ui, "发送", .variant = CUI_BUTTON_PRIMARY,
+                                          .disabled = !can_send);
                 int submitted = cui_input(ui, "send-input", current->tx_input,
                                           sizeof current->tx_input,
                                           .placeholder = current->tx_hex ? "例如 01 03 00 00" :
@@ -666,9 +697,6 @@ static void draw_session(serial_session *current, cui_ctx *ui)
                 cui_switch(ui, "十六进制", &current->tx_hex);
                 cui_select(ui, "line-ending", endings, 4, &current->ending_index,
                            .width = CUI_PX(126), .disabled = current->tx_hex);
-                bool can_send = connected && !serial_is_sending(&current->serial);
-                bool clicked = cui_button(ui, "发送", .variant = CUI_BUTTON_PRIMARY,
-                                          .disabled = !can_send);
                 if (can_send && (clicked || (submitted & CUI_SUBMITTED)))
                 {
                     send_input(current);
@@ -894,8 +922,11 @@ static void draw_serial_settings(serial_session *current, cui_ctx *ui, bool conn
 
     cui_row(ui, .width = CUI_FILL, .gap = 8)
     {
-        cui_select(ui, "port", current->port_items, current->port_count, &current->port_index,
-                   .placeholder = "选择串口", .width = CUI_PX(124), .disabled = connected);
+        if (cui_select(ui, "port", current->port_items, current->port_count, &current->port_index,
+                       .placeholder = "选择串口", .width = CUI_PX(124), .disabled = connected))
+        {
+            current->access_error[0] = '\0';
+        }
         if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .tooltip = "刷新串口", .disabled = connected))
         {
             refresh_ports(current);
@@ -920,7 +951,14 @@ static void draw_serial_settings(serial_session *current, cui_ctx *ui, bool conn
                    .label = "停止位", .width = CUI_PX(100), .disabled = connected);
     }
     cui_switch(ui, "硬件流控（RTS/CTS）", &current->flow_control, .disabled = connected);
-    cui_secondary(ui, current->status);
+    if (current->access_error[0] != '\0')
+    {
+        draw_serial_access_error(current, ui);
+    }
+    else
+    {
+        cui_secondary(ui, current->status);
+    }
     if (connected)
     {
         cui_secondary(ui, "断开连接后可修改串口参数");
@@ -1012,6 +1050,7 @@ static void refresh_ports(serial_session *current)
 {
     char previous[16] = "";
     char target[1024];
+    current->access_error[0] = '\0';
 
     if (current->port_index >= 0)
     {
@@ -1229,6 +1268,7 @@ static void toggle_connection(serial_session *current)
     DWORD error;
     unsigned long baud;
     serial_config config;
+    current->access_error[0] = '\0';
 
     if (serial_is_open(&current->serial))
     {
@@ -1261,7 +1301,11 @@ static void toggle_connection(serial_session *current)
         const char *reason = "无法打开或配置串口";
         if (error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION)
         {
-            reason = "串口被占用或访问被拒绝";
+            snprintf(current->access_error, sizeof current->access_error,
+                     "%s | 串口被占用或访问被拒绝（错误码 %lu）",
+                     current->port_names[current->port_index], (unsigned long)error);
+            snprintf(current->status, sizeof current->status, "未连接");
+            return;
         }
         else if (error == ERROR_FILE_NOT_FOUND || error == ERROR_DEVICE_NOT_CONNECTED)
         {
