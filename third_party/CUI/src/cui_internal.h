@@ -395,6 +395,7 @@ typedef struct cui_interact {
 
 enum { CUI_IF_FOCUSABLE = 1, CUI_IF_DRAG = 2, CUI_IF_KEEP_FOCUS = 4, CUI_IF_TEXT = 8 };
 cui_interact cui__interact(cui_ctx *ui, cui_id id, int flags);
+bool cui__keys_covered(cui_ctx *ui);
 void cui__mark_interactive(cui_ctx *ui, int node, int flags);
 void cui__set_cursor(cui_ctx *ui, cui_cursor c);
 void cui__wakeup_after(cui_ctx *ui, float seconds);

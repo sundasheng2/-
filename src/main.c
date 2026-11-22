@@ -7,10 +7,13 @@
 #include "favorites.h"
 #include "text_decode.h"
 #include "serial_ansi.h"
+#include "log_archive.h"
 
 #include <commdlg.h>
 #include <ctype.h>
+#include <dwmapi.h>
 #include <share.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +27,34 @@
 
 #define MAX_SESSIONS 8
 #define LOG_FONT_CHOICES 4
+
+typedef struct
+{
+    DWORD id;
+    const char *name;
+    cui_theme_mode mode;
+    cui_accent accent;
+    cui_color control_surface;
+    cui_color control_border;
+    cui_color log_surface;
+    cui_color log_text;
+} appearance;
+
+/* ID 保存到当前用户的配置中。2 和 3 曾用于已移除的主题，不再复用。 */
+enum { THEME_DARK, THEME_LIGHT, THEME_OLIVE = 4 };
+
+static const appearance themes[] = {
+    {THEME_DARK, "经典深色", CUI_THEME_DARK, CUI_ACCENT_BLUE, CUI_RGB(0x25282d), CUI_RGB(0x3a3e46),
+     CUI_RGB(0x202227), CUI_RGB(0x91dda8)},
+    {THEME_LIGHT, "明亮", CUI_THEME_LIGHT, CUI_ACCENT_BLUE, CUI_RGB(0xf1f2f3), CUI_RGB(0xd7dade),
+     CUI_RGB(0xf1f2f3), CUI_RGB(0x24282d)},
+    {THEME_OLIVE, "米白橄榄", CUI_THEME_LIGHT, CUI_ACCENT_GREEN, CUI_RGB(0xece7d9), CUI_RGB(0xd8d0bc),
+     CUI_RGB(0xf0ebdf), CUI_RGB(0x475233)},
+};
+
+static const wchar_t app_settings_key[] = L"Software\\STM32SerialConsole";
+static DWORD theme_index;
+static bool theme_save_failed;
 
 /* 数值对应保存对话框中文件类型的一基索引。 */
 typedef enum
@@ -44,6 +75,7 @@ typedef struct
     int id;
     session_kind kind;
     ssh_session ssh;
+    cui_terminal_buffer ssh_terminal;
     serial_port serial;
     char port_names[SERIAL_MAX_PORT][16];
     const char *port_items[SERIAL_MAX_PORT];
@@ -52,6 +84,7 @@ typedef struct
     char baud_input[16];
     char tx_input[SERIAL_COMMAND_CAPACITY];
     char status[192];
+    bool status_error_pending;
     char access_error[128];
     int data_bits_index;
     int parity_index;
@@ -65,6 +98,8 @@ typedef struct
     unsigned long long submitted_bytes;
     FILE *capture;
     capture_format capture_mode;
+    wchar_t capture_root[MAX_PATH];
+    log_archive capture_archive;
     bool capture_after_cr;
     bool capture_line_started;
     ULONGLONG last_rx_ms;
@@ -74,7 +109,11 @@ typedef struct
     serial_ansi rx_ansi;
     cui_log_buffer text_log;
     cui_log_buffer hex_log;
-    cui_log_line text_lines[LOG_LINES];
+    union
+    {
+        cui_log_line text_lines[LOG_LINES];
+        cui_terminal_line ssh_lines[LOG_LINES];
+    };
     cui_log_line hex_lines[LOG_LINES];
     char text_storage[LOG_BYTES];
     char hex_storage[LOG_BYTES];
@@ -88,6 +127,9 @@ static int selected_tab;
 static int next_session_id;
 static int menu_session_id;
 static bool show_settings;
+static bool show_log_recording_settings;
+static wchar_t log_folder[MAX_PATH];
+static const char *log_folder_error;
 static bool show_new_session;
 static int new_session_kind;
 static bool show_log_tools;
@@ -113,6 +155,7 @@ static void poll_serial(serial_session *current);
 static void send_input(serial_session *current);
 static bool send_command(serial_session *current, const char *text, bool hex, int ending_index);
 static void toggle_capture(serial_session *current);
+static bool update_daily_capture(serial_session *current, const SYSTEMTIME *time);
 static const char *capture_label(const serial_session *current);
 static bool write_capture(serial_session *current, const unsigned char *data, size_t length);
 static bool write_text_capture(serial_session *current, const unsigned char *data, size_t length,
@@ -124,11 +167,17 @@ static void close_session(serial_session *current);
 static void close_tab(int index);
 static void poll_sessions(void);
 static void draw_workspace(cui_ctx *ui);
+static void draw_app_settings(cui_ctx *ui);
+static void apply_theme_palette(cui_ctx *ui, DWORD theme_id);
+static void draw_log_recording_settings(cui_app *app, cui_ctx *ui);
+static void save_log_folder(const wchar_t *folder);
 static void draw_session_menu(cui_ctx *ui, bool requested);
 static void draw_new_session(cui_ctx *ui);
 static void draw_ssh_session(serial_session *current, cui_ctx *ui);
+static void poll_ssh_session(serial_session *current);
 static void stop_ssh_session(serial_session *current);
 static void draw_session(serial_session *current, cui_ctx *ui);
+static void report_session_error(serial_session *current, const char *format, ...);
 static void draw_serial_access_error(const serial_session *current, cui_ctx *ui);
 static void draw_quick_commands(serial_session *current, cui_ctx *ui, bool connected);
 static void draw_command_editor(serial_session *current, cui_ctx *ui);
@@ -147,6 +196,7 @@ static void remove_favorite(serial_session *current, bool session);
 static bool save_favorites(serial_session *current, const favorites *updated, const char *message);
 static void flush_text(serial_session *current, bool finish);
 static double local_clock_seconds(void);
+static double clock_seconds(const SYSTEMTIME *time);
 static void append_hex(serial_session *current, const char *direction,
                        const unsigned char *data, size_t length);
 static bool parse_hex(const char *input, unsigned char *output, size_t *length);
@@ -155,6 +205,23 @@ static cui_font load_system_font(cui_ctx *ui, const char *directory, const char 
 
 int main(void)
 {
+    DWORD preferred_theme;
+    DWORD theme_size = sizeof preferred_theme;
+    if (RegGetValueW(HKEY_CURRENT_USER, app_settings_key, L"Theme", RRF_RT_REG_DWORD,
+                     NULL, &preferred_theme, &theme_size) == ERROR_SUCCESS)
+    {
+        for (DWORD i = 0; i < sizeof themes / sizeof themes[0]; i++)
+        {
+            if (themes[i].id == preferred_theme)
+            {
+                theme_index = i;
+                break;
+            }
+        }
+    }
+    DWORD folder_size = sizeof log_folder;
+    RegGetValueW(HKEY_CURRENT_USER, app_settings_key, L"LogFolder", RRF_RT_REG_SZ | RRF_ZEROONFAILURE,
+                 NULL, log_folder, &folder_size);
     cui_app *app = cui_app_create(&(cui_app_desc){
         .title = "STM32 串口调试助手",
         .width = 1100,
@@ -162,8 +229,8 @@ int main(void)
         .min_width = 800,
         .min_height = 540,
         .continuous = true,
-        .theme = CUI_THEME_DARK,
-        .accent = CUI_ACCENT_BLUE,
+        .theme = themes[theme_index].mode,
+        .accent = themes[theme_index].accent,
     });
 
     if (app == NULL)
@@ -179,6 +246,7 @@ int main(void)
         cui_app_destroy(app);
         return 1;
     }
+    apply_theme_palette(cui_app_ui(app), themes[theme_index].id);
 
     serial_session *initial = create_session(SESSION_SERIAL);
     if (!favorites_load_default(favorites_path, &saved))
@@ -189,7 +257,27 @@ int main(void)
     while (cui_app_frame(app))
     {
         poll_sessions();
-        draw_workspace(cui_app_ui(app));
+        cui_ctx *ui = cui_app_ui(app);
+        DWORD previous_theme = theme_index;
+        /* CUI 在帧开始时推进主题过渡，随后应用自定义色板。 */
+        apply_theme_palette(ui, themes[theme_index].id);
+        draw_workspace(ui);
+        draw_log_recording_settings(app, ui);
+        if (theme_index != previous_theme)
+        {
+            const appearance *theme = &themes[theme_index];
+            cui_set_theme(ui, theme->mode);
+            cui_set_accent(ui, theme->accent);
+
+            HWND window = cui_app_native_window(app);
+            BOOL dark = theme->mode == CUI_THEME_DARK;
+            if (FAILED(DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                                             &dark, sizeof dark)))
+            {
+                /* 旧版 Windows 10 使用属性 19。 */
+                DwmSetWindowAttribute(window, 19, &dark, sizeof dark);
+            }
+        }
         /* CUI 空闲时也要处理串口完成事件，限制软件渲染时的轮询频率。 */
         Sleep(8);
     }
@@ -238,6 +326,9 @@ static serial_session *create_session(session_kind kind)
         {
             snprintf(current->ssh.port, sizeof current->ssh.port, "22");
             snprintf(current->status, sizeof current->status, "未连接");
+            cui_terminal_init(&current->ssh_terminal, current->text_storage, sizeof current->text_storage,
+                              current->ssh_lines, LOG_LINES);
+            cui_terminal_set_screen_rows(&current->ssh_terminal, SSH_TERMINAL_ROWS);
         }
         selected_tab = tab_count;
         tabs[tab_count++] = current;
@@ -290,13 +381,7 @@ static void poll_sessions(void)
         }
         else
         {
-            DWORD exit_code;
-            if (ssh_session_poll(&current->ssh, &exit_code))
-            {
-                snprintf(current->status, sizeof current->status,
-                         exit_code == 0 ? "SSH 终端已关闭" : "SSH 已退出（退出码 %lu）",
-                         (unsigned long)exit_code);
-            }
+            poll_ssh_session(current);
         }
     }
 }
@@ -354,17 +439,28 @@ static void draw_workspace(cui_ctx *ui)
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 12, .gap = 8)
     {
-        cui_row(ui, .width = CUI_FILL, .gap = 8)
+        cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER)
         {
-            action = cui_doc_tabs(ui, "serial-sessions", items, tab_count, &selected_tab,
-                                  .shortcuts = !show_settings && !show_command_editor && !show_new_session,
-                                  .no_reorder = true);
-            new_requested = cui_button(ui, CUI_ICON_PLUS " 新建会话",
-                                       .size = CUI_SIZE_SM,
-                                       .disabled = tab_count == MAX_SESSIONS,
-                                       .tooltip = tab_count == MAX_SESSIONS ?
-                                                  "最多打开 8 个会话" : NULL);
+            /* 标签较多时让标签栏内部滚动，给两个图标留出位置。 */
+            cui_column(ui, .max_width = cui_viewport_size(ui).x - 120)
+            {
+                /* SSH 中的 Ctrl+W 交给远端行编辑，其他会话快捷键照常。 */
+                bool ssh_word_delete = tabs[selected_tab]->ssh.process != NULL &&
+                                       cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_W);
+                action = cui_doc_tabs(ui, "serial-sessions", items, tab_count, &selected_tab,
+                                      .shortcuts = !show_settings && !show_command_editor &&
+                                                   !show_new_session && !ssh_word_delete,
+                                      .no_reorder = true);
+            }
+            new_requested = cui_icon_button(ui, CUI_ICON_PLUS,
+                                           .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+                                           .disabled = tab_count == MAX_SESSIONS,
+                                           .tooltip = tab_count == MAX_SESSIONS ?
+                                                      "最多打开 8 个会话" : "新建会话");
+            cui_spacer(ui);
+            draw_app_settings(ui);
         }
+        cui_separator(ui);
         bool menu_requested = action.context >= 0 && !show_settings && !show_new_session;
         if (menu_requested)
         {
@@ -415,6 +511,171 @@ static void draw_workspace(cui_ctx *ui)
         }
         cui_pop_id(ui);
         draw_new_session(ui);
+    }
+}
+
+static void draw_app_settings(cui_ctx *ui)
+{
+    cui_menu(ui, "软件设置", .icon = CUI_ICON_SETTINGS, .icon_only = true,
+             .variant = CUI_BUTTON_GHOST, .placement = CUI_PLACE_BOTTOM_END)
+    {
+        cui_menu(ui, "主题", .icon = CUI_ICON_PALETTE, .variant = CUI_BUTTON_GHOST,
+                 .placement = CUI_PLACE_LEFT_START)
+        {
+            for (DWORD i = 0; i < sizeof themes / sizeof themes[0]; i++)
+            {
+                if (cui_menu_item(ui, themes[i].name, .checked = i == theme_index))
+                {
+                    theme_index = i;
+                    theme_save_failed = RegSetKeyValueW(HKEY_CURRENT_USER, app_settings_key, L"Theme",
+                                                        REG_DWORD, &themes[i].id,
+                                                        sizeof themes[i].id) != ERROR_SUCCESS;
+                }
+            }
+        }
+        if (theme_save_failed)
+        {
+            cui_menu_label(ui, "无法保存主题选择");
+        }
+        if (cui_menu_item(ui, "日志记录设置", .icon = CUI_ICON_FILE_TEXT))
+        {
+            log_folder_error = NULL;
+            show_log_recording_settings = true;
+        }
+    }
+}
+
+static void apply_theme_palette(cui_ctx *ui, DWORD theme_id)
+{
+    static const cui_color light_palette[CUI_TOKEN_COUNT] = {
+        [CUI_TOKEN_BACKGROUND] = CUI_RGB(0xf2f2f3),
+        [CUI_TOKEN_SURFACE] = CUI_RGB(0xfdfdfd),
+        [CUI_TOKEN_SURFACE_RAISED] = CUI_RGB(0xfdfdfd),
+        [CUI_TOKEN_SURFACE_MUTED] = CUI_RGB(0xf8f8f9),
+        [CUI_TOKEN_FOREGROUND] = CUI_RGB(0x24282d),
+        [CUI_TOKEN_TEXT_SECONDARY] = CUI_RGB(0x505962),
+        [CUI_TOKEN_TEXT_MUTED] = CUI_RGB(0x626b73),
+        [CUI_TOKEN_BORDER] = CUI_RGB(0xd7dade),
+        [CUI_TOKEN_BORDER_SUBTLE] = CUI_RGB(0xe5e7ea),
+        [CUI_TOKEN_BORDER_STRONG] = CUI_RGB(0x9ba6ac),
+        [CUI_TOKEN_ACCENT] = CUI_RGB(0x007d6a),
+        [CUI_TOKEN_ACCENT_STRONG] = CUI_RGB(0x006653),
+        [CUI_TOKEN_ACCENT_SUBTLE] = CUI_RGBA(0x007d6a22),
+        [CUI_TOKEN_ACCENT_FOREGROUND] = CUI_RGB(0xffffff),
+        [CUI_TOKEN_CONTROL_ON] = CUI_RGB(0x007d6a),
+        [CUI_TOKEN_CONTROL_GLYPH] = CUI_RGB(0xffffff),
+        [CUI_TOKEN_CONTROL_TRACK] = CUI_RGB(0xdfe3e6),
+        [CUI_TOKEN_CONTROL_TRACK_HOVER] = CUI_RGB(0xd2d9dc),
+        [CUI_TOKEN_FOCUS_RING] = CUI_RGB(0x318d7d),
+        [CUI_TOKEN_INFO] = CUI_RGB(0x007d6a),
+    };
+    static const cui_color olive_palette[CUI_TOKEN_COUNT] = {
+        [CUI_TOKEN_BACKGROUND] = CUI_RGB(0xf5f1e8),
+        [CUI_TOKEN_SURFACE] = CUI_RGB(0xfbf8f1),
+        [CUI_TOKEN_SURFACE_RAISED] = CUI_RGB(0xfcf9f2),
+        [CUI_TOKEN_SURFACE_MUTED] = CUI_RGB(0xfaf7ef),
+        [CUI_TOKEN_FOREGROUND] = CUI_RGB(0x34362b),
+        [CUI_TOKEN_TEXT_SECONDARY] = CUI_RGB(0x62664e),
+        [CUI_TOKEN_TEXT_MUTED] = CUI_RGB(0x6d705b),
+        [CUI_TOKEN_BORDER] = CUI_RGB(0xddd5c4),
+        [CUI_TOKEN_BORDER_SUBTLE] = CUI_RGB(0xe9e2d5),
+        [CUI_TOKEN_BORDER_STRONG] = CUI_RGB(0xa49d89),
+        [CUI_TOKEN_ACCENT] = CUI_RGB(0x546139),
+        [CUI_TOKEN_ACCENT_STRONG] = CUI_RGB(0x414d2b),
+        [CUI_TOKEN_ACCENT_SUBTLE] = CUI_RGBA(0x54613928),
+        [CUI_TOKEN_ACCENT_FOREGROUND] = CUI_RGB(0xfffbef),
+        [CUI_TOKEN_SUCCESS] = CUI_RGB(0x546139),
+        [CUI_TOKEN_CONTROL_ON] = CUI_RGB(0x546139),
+        [CUI_TOKEN_CONTROL_GLYPH] = CUI_RGB(0xfffbef),
+        [CUI_TOKEN_CONTROL_TRACK] = CUI_RGB(0xe1dacb),
+        [CUI_TOKEN_CONTROL_TRACK_HOVER] = CUI_RGB(0xd8d1c0),
+        [CUI_TOKEN_FOCUS_RING] = CUI_RGB(0x858e68),
+    };
+    const cui_color *palette;
+    switch (theme_id)
+    {
+    case THEME_LIGHT:
+        palette = light_palette;
+        break;
+    case THEME_OLIVE:
+        palette = olive_palette;
+        break;
+    default:
+        return;
+    }
+
+    cui_color *colors = cui_theme_get(ui)->colors;
+    for (int token = 1; token < CUI_TOKEN_COUNT; token++)
+    {
+        if (palette[token].a != 0)
+        {
+            colors[token] = palette[token];
+        }
+    }
+}
+
+static void draw_log_recording_settings(cui_app *app, cui_ctx *ui)
+{
+    cui_dialog(ui, "日志记录设置", &show_log_recording_settings, .width = 560)
+    {
+        char path[MAX_PATH * 4];
+        cui_text(ui, "默认日志文件夹");
+        if (log_folder[0] == L'\0')
+        {
+            cui_secondary(ui, "未设置，开始记录时手动选择文件。");
+        }
+        else if (WideCharToMultiByte(CP_UTF8, 0, log_folder, -1, path, sizeof path, NULL, NULL))
+        {
+            cui_text(ui, path, .width = CUI_FILL);
+        }
+        cui_secondary(ui, "按 COM 口和本机日期保存 TXT，例如 COM3\\2026-11-22.txt。");
+        if (log_folder_error != NULL)
+        {
+            cui_text(ui, log_folder_error, .color = CUI_COLOR_DANGER);
+        }
+        cui_dialog_footer(ui)
+        {
+            if (cui_button(ui, "选择文件夹…"))
+            {
+                wchar_t selected[MAX_PATH];
+                if (cui_app_file_dialog(app, &(cui_file_dialog_opts){
+                        .kind = CUI_FILE_FOLDER, .title = "选择默认日志文件夹"}, path, sizeof path))
+                {
+                    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, selected, MAX_PATH))
+                    {
+                        save_log_folder(selected);
+                    }
+                    else
+                    {
+                        log_folder_error = "无法读取所选路径，请选择较短的文件夹路径。";
+                    }
+                }
+            }
+            if (cui_button(ui, "清除默认文件夹", .disabled = log_folder[0] == L'\0'))
+            {
+                save_log_folder(L"");
+            }
+            if (cui_button(ui, "完成", .variant = CUI_BUTTON_PRIMARY))
+            {
+                show_log_recording_settings = false;
+            }
+        }
+    }
+}
+
+static void save_log_folder(const wchar_t *folder)
+{
+    DWORD size = (DWORD)((wcslen(folder) + 1) * sizeof folder[0]);
+    LSTATUS error = RegSetKeyValueW(HKEY_CURRENT_USER, app_settings_key, L"LogFolder",
+                                    REG_SZ, folder, size);
+    if (error == ERROR_SUCCESS)
+    {
+        wcscpy(log_folder, folder);
+        log_folder_error = NULL;
+    }
+    else
+    {
+        log_folder_error = "无法保存默认日志文件夹，请检查当前用户的设置权限。";
     }
 }
 
@@ -493,20 +754,18 @@ static void draw_ssh_session(serial_session *current, cui_ctx *ui)
 {
     ssh_session *ssh = &current->ssh;
     bool running = ssh->process != NULL;
-    cui_column(ui, .width = CUI_FILL, .pad = 16, .gap = 12,
-               .bg = CUI_RGB(0x20252d), .border = 1, .border_color = CUI_RGB(0x37414e), .radius = 9)
+    cui_row(ui, .width = CUI_FILL, .pad_x = 12, .pad_y = 10, .gap = 10,
+            .align = CUI_ALIGN_END, .bg = themes[theme_index].control_surface, .border = 1,
+            .border_color = themes[theme_index].control_border, .radius = 9)
     {
-        cui_text(ui, "SSH 连接", .font = CUI_FONT_MEDIUM, .size = 16);
-        cui_row(ui, .width = CUI_FILL, .gap = 12)
-        {
-            cui_input(ui, "ssh-host", ssh->host, sizeof ssh->host, .label = "远程主机",
-                      .placeholder = "主机名或 IP 地址", .width = CUI_FILL, .disabled = running);
-            cui_input(ui, "ssh-user", ssh->user, sizeof ssh->user, .label = "用户名",
-                      .placeholder = "可留空", .width = CUI_PX(184), .disabled = running);
-            cui_input(ui, "ssh-port", ssh->port, sizeof ssh->port, .label = "端口",
-                      .width = CUI_PX(88), .disabled = running);
-        }
-        cui_row(ui, .gap = 12)
+        cui_input(ui, "ssh-host", ssh->host, sizeof ssh->host, .label = "远程主机",
+                  .placeholder = "主机名或 IP 地址", .width = CUI_PX(248), .disabled = running);
+        cui_input(ui, "ssh-user", ssh->user, sizeof ssh->user, .label = "用户名",
+                  .placeholder = "可留空", .width = CUI_PX(136), .disabled = running);
+        cui_input(ui, "ssh-port", ssh->port, sizeof ssh->port, .label = "端口",
+                  .width = CUI_PX(84), .disabled = running);
+        cui_row(ui, .width = CUI_FILL, .min_height = cui_theme_get(ui)->control_md,
+                .gap = 8, .align = CUI_ALIGN_CENTER)
         {
             if (cui_button(ui, running ? "断开" : "连接", .variant = CUI_BUTTON_PRIMARY))
             {
@@ -520,7 +779,8 @@ static void draw_ssh_session(serial_session *current, cui_ctx *ui)
                     switch (error)
                     {
                     case ERROR_SUCCESS:
-                        snprintf(current->status, sizeof current->status, "SSH 终端已启动");
+                        cui_terminal_clear(&current->ssh_terminal);
+                        snprintf(current->status, sizeof current->status, "SSH 客户端运行中");
                         break;
                     case ERROR_INVALID_PARAMETER:
                         snprintf(current->status, sizeof current->status,
@@ -531,6 +791,10 @@ static void draw_ssh_session(serial_session *current, cui_ctx *ui)
                         snprintf(current->status, sizeof current->status,
                                  "找不到 Windows OpenSSH 客户端");
                         break;
+                    case ERROR_NOT_SUPPORTED:
+                        snprintf(current->status, sizeof current->status,
+                                 "内嵌 SSH 需要 Windows 10 1809 或更新版本");
+                        break;
                     default:
                         snprintf(current->status, sizeof current->status,
                                  "无法启动 SSH（错误码 %lu）", (unsigned long)error);
@@ -538,9 +802,43 @@ static void draw_ssh_session(serial_session *current, cui_ctx *ui)
                     }
                 }
             }
-            cui_text(ui, current->status);
+            cui_text(ui, current->status, .width = CUI_FILL);
         }
-        cui_secondary(ui, "登录和远程操作在独立终端窗口中进行。");
+    }
+    cui_terminal_result terminal = cui_terminal(ui, "ssh-terminal", &current->ssh_terminal,
+                                                .height = -1, .size = 14, .no_input = true,
+                                                .raw_input = ssh->process != NULL);
+    if (ssh->process != NULL && (terminal.input_length != 0 || terminal.interrupt))
+    {
+        DWORD error = terminal.interrupt ? ssh_session_write(ssh, "\x03", 1) :
+                      ssh_session_write(ssh, terminal.input, (DWORD)terminal.input_length);
+        if (error != ERROR_SUCCESS)
+        {
+            snprintf(current->status, sizeof current->status, "无法输入 SSH 终端（错误码 %lu）",
+                     (unsigned long)error);
+        }
+    }
+}
+
+static void poll_ssh_session(serial_session *current)
+{
+    char output[4096];
+    for (DWORD total = 0; total < RX_BUDGET_BYTES;)
+    {
+        DWORD count = ssh_session_read(&current->ssh, output, sizeof output);
+        if (count == 0)
+        {
+            break;
+        }
+        cui_terminal_write(&current->ssh_terminal, output, (int)count);
+        total += count;
+    }
+    DWORD exit_code;
+    if (ssh_session_poll(&current->ssh, &exit_code))
+    {
+        snprintf(current->status, sizeof current->status,
+                 exit_code == 0 ? "SSH 终端已关闭" : "SSH 已退出（退出码 %lu）",
+                 (unsigned long)exit_code);
     }
 }
 
@@ -639,19 +937,21 @@ static void draw_serial_access_error(const serial_session *current, cui_ctx *ui)
 static void draw_session(serial_session *current, cui_ctx *ui)
 {
     const char *endings[] = {"无换行", "回车（CR）", "换行（LF）", "回车换行"};
-    char counters[128];
     bool connected = serial_is_open(&current->serial) != FALSE;
     bool text_view = current->view_index == 0;
-    const cui_color control_surface = CUI_RGB(0x20252d);
-    const cui_color control_border = CUI_RGB(0x37414e);
+    const appearance *theme = &themes[theme_index];
 
-    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 10)
+    if (current->status_error_pending)
     {
-        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 5, .gap = 4,
-                   .bg = CUI_RGB(0x1c2a3b), .border = 1, .border_color = CUI_RGB(0x46698e),
-                   .radius = 10)
+        cui_toast(ui, current->status, .tone = CUI_TONE_DANGER);
+        current->status_error_pending = false;
+    }
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 6)
+    {
+        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL)
         {
-            cui_row(ui, .width = CUI_FILL, .pad_x = 7, .gap = 9)
+            cui_row(ui, .width = CUI_FILL, .pad_x = 8, .gap = 9,
+                    .bg = theme->log_surface, .radius_tl = 5, .radius_tr = 5)
             {
                 cui_text(ui, CUI_ICON_TERMINAL, .font = CUI_FONT_ICONS, .color = CUI_COLOR_ACCENT);
                 cui_text(ui, "串口日志", .font = CUI_FONT_MEDIUM, .size = 16, .nowrap = true);
@@ -660,57 +960,77 @@ static void draw_session(serial_session *current, cui_ctx *ui)
                 bool recording = current->capture != NULL;
                 if (cui_button(ui, recording ? "停止记录" : "记录接收数据",
                                .icon = recording ? CUI_ICON_SQUARE : CUI_ICON_CIRCLE_DOT,
-                               .size = CUI_SIZE_SM, .selected = recording,
+                               .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST, .selected = recording,
                                .tooltip = recording ? capture_label(current) : "将当前会话收到的数据保存到文件"))
                 {
                     toggle_capture(current);
                 }
                 if (cui_button(ui, "日志工具", .icon = CUI_ICON_SEARCH, .size = CUI_SIZE_SM,
-                               .selected = show_log_tools,
+                               .variant = CUI_BUTTON_GHOST, .selected = show_log_tools,
                                .tooltip = "搜索、筛选、滚动、复制和清空"))
                 {
                     show_log_tools = !show_log_tools;
                 }
             }
+            if (show_log_tools)
+            {
+                char counters[128];
+                snprintf(counters, sizeof counters, "已接收 %llu 字节   已提交发送 %llu 字节",
+                         current->received_bytes, current->submitted_bytes);
+                cui_row(ui, .width = CUI_FILL, .pad_x = 8, .pad_y = 3, .gap = 8)
+                {
+                    cui_text(ui, current->status, .width = CUI_FILL, .nowrap = true,
+                             .color = CUI_COLOR_TEXT_SECONDARY);
+                    cui_secondary(ui, counters);
+                }
+            }
             cui_log_view(ui, text_view ? "text-log" : "hex-log",
                          text_view ? &current->text_log : &current->hex_log,
                          .height = -1, .timestamps = true, .no_toolbar = !show_log_tools,
-                         .no_level_column = true, .info_color = CUI_RGB(0x00ff00),
+                         .no_level_column = true, .info_color = theme->log_text,
                          .copy_body_prefix = "接收  ",
                          .size = (float)log_font_size, .font = log_fonts[log_font_index]);
         }
-        cui_column(ui, .width = CUI_FILL, .pad_x = 12, .pad_y = 7, .gap = 6,
-                   .bg = control_surface, .border = 1, .border_color = control_border, .radius = 9)
+        cui_column(ui, .width = CUI_FILL, .gap = 6)
         {
-            draw_quick_commands(current, ui, connected);
-            cui_separator(ui);
-            cui_row(ui, .gap = 8, .width = CUI_FILL)
+            cui_column(ui, .width = CUI_FILL, .pad_x = 8,
+                       .bg = theme->control_surface, .radius = 5)
+            {
+                draw_quick_commands(current, ui, connected);
+            }
+            cui_row(ui, .gap = 8, .width = CUI_FILL, .align = CUI_ALIGN_START)
             {
                 bool can_send = connected && !serial_is_sending(&current->serial);
                 bool clicked = cui_button(ui, "发送", .variant = CUI_BUTTON_PRIMARY,
-                                          .disabled = !can_send);
-                int submitted = cui_input(ui, "send-input", current->tx_input,
-                                          sizeof current->tx_input,
-                                          .placeholder = current->tx_hex ? "例如 01 03 00 00" :
-                                                                 "输入要发送的命令",
-                                          .width = CUI_FILL);
-                cui_switch(ui, "十六进制", &current->tx_hex);
-                cui_select(ui, "line-ending", endings, 4, &current->ending_index,
-                           .width = CUI_PX(126), .disabled = current->tx_hex);
+                                          .disabled = !can_send,
+                                          .tooltip = "回车发送，Shift+Enter 换行");
+                int submitted = cui_textarea(ui, "send-input", current->tx_input,
+                                             sizeof current->tx_input,
+                                             .placeholder = current->tx_hex ? "例如 01 03 00 00" :
+                                                                              "输入要发送的命令",
+                                             .width = CUI_FILL, .height = 80, .enter_submits = true);
+                cui_column(ui, .width = CUI_PX(126), .gap = 6, .align = CUI_ALIGN_START)
+                {
+                    cui_switch(ui, "十六进制", &current->tx_hex);
+                    cui_select(ui, "line-ending", endings, 4, &current->ending_index,
+                               .width = CUI_FILL, .disabled = current->tx_hex);
+                }
                 if (can_send && (clicked || (submitted & CUI_SUBMITTED)))
                 {
                     send_input(current);
                 }
             }
         }
-        cui_row(ui, .gap = 14)
-        {
-            cui_text(ui, current->status);
-            snprintf(counters, sizeof counters, "已接收 %llu 字节   已提交发送 %llu 字节",
-                     current->received_bytes, current->submitted_bytes);
-            cui_secondary(ui, counters);
-        }
     }
+}
+
+static void report_session_error(serial_session *current, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vsnprintf(current->status, sizeof current->status, format, args);
+    va_end(args);
+    current->status_error_pending = true;
 }
 
 static void draw_quick_commands(serial_session *current, cui_ctx *ui, bool connected)
@@ -1311,8 +1631,8 @@ static void toggle_connection(serial_session *current)
         {
             reason = "串口不可用";
         }
-        snprintf(current->status, sizeof current->status, "%s | %s（错误码 %lu）",
-                 current->port_names[current->port_index], reason, (unsigned long)error);
+        report_session_error(current, "%s | %s（错误码 %lu）",
+                             current->port_names[current->port_index], reason, (unsigned long)error);
         return;
     }
     snprintf(current->status, sizeof current->status, "已连接 | %s，波特率 %lu", current->port_names[current->port_index], baud);
@@ -1323,6 +1643,13 @@ static void poll_serial(serial_session *current)
     const unsigned char *data;
     DWORD length;
     ULONGLONG now = GetTickCount64();
+    SYSTEMTIME local_time;
+
+    if (current->capture != NULL && current->capture_root[0] != L'\0')
+    {
+        GetLocalTime(&local_time);
+        update_daily_capture(current, &local_time);
+    }
 
     for (DWORD total = 0; serial_is_open(&current->serial) && total < RX_BUDGET_BYTES; total += length)
     {
@@ -1332,20 +1659,24 @@ static void poll_serial(serial_session *current)
             serial_close(&current->serial);
             flush_text(current, true);
             current->rx_ansi = (serial_ansi){0};
-            snprintf(current->status, sizeof current->status, "已断开 | 串口读写失败（错误码 %lu）",
-                     (unsigned long)error);
+            report_session_error(current, "已断开 | 串口读写失败（错误码 %lu）",
+                                 (unsigned long)error);
             break;
         }
         if (length == 0)
         {
             break;
         }
-        current->last_rx_time = local_clock_seconds();
-        if (current->capture != NULL && !write_capture(current, data, length))
+        GetLocalTime(&local_time);
+        current->last_rx_time = clock_seconds(&local_time);
+        if (current->capture != NULL &&
+            (current->capture_root[0] == L'\0' || update_daily_capture(current, &local_time)) &&
+            !write_capture(current, data, length))
         {
             fclose(current->capture);
             current->capture = NULL;
-            snprintf(current->status, sizeof current->status, "记录已停止 | 写入文件失败");
+            current->capture_root[0] = L'\0';
+            report_session_error(current, "记录已停止 | 写入文件失败");
         }
         current->received_bytes += length;
         current->last_rx_ms = now;
@@ -1408,8 +1739,13 @@ static double local_clock_seconds(void)
 {
     SYSTEMTIME time;
     GetLocalTime(&time);
+    return clock_seconds(&time);
+}
+
+static double clock_seconds(const SYSTEMTIME *time)
+{
     /* 日志控件接收秒数并显示三位毫秒，超时仍使用单调计时。 */
-    return time.wHour * 3600 + time.wMinute * 60 + time.wSecond + time.wMilliseconds / 1000.0;
+    return time->wHour * 3600 + time->wMinute * 60 + time->wSecond + time->wMilliseconds / 1000.0;
 }
 
 static void append_hex(serial_session *current, const char *direction,
@@ -1461,7 +1797,7 @@ static bool send_command(serial_session *current, const char *text, bool hex, in
     {
         if (!parse_hex(text, data, &length))
         {
-            snprintf(current->status, sizeof current->status, "请输入成对的十六进制数字，例如 01 03 FF");
+            report_session_error(current, "请输入成对的十六进制数字，例如 01 03 FF");
             return false;
         }
     }
@@ -1480,14 +1816,29 @@ static bool send_command(serial_session *current, const char *text, bool hex, in
     error = serial_send(&current->serial, data, (DWORD)length);
     if (error != ERROR_SUCCESS)
     {
-        snprintf(current->status, sizeof current->status, "发送失败（错误码 %lu）", (unsigned long)error);
+        report_session_error(current, "发送失败（错误码 %lu）", (unsigned long)error);
         return false;
     }
     current->submitted_bytes += length;
     current->text_log.now = local_clock_seconds();
     current->hex_log.now = current->text_log.now;
     append_hex(current, "发送", data, length);
-    cui_log_append(&current->text_log, CUI_LOG_INFO, "发送  %s", text);
+    /* 文本日志每条只显示一行，分别记录编辑框里的各行。 */
+    const char *line = text;
+    do
+    {
+        size_t line_length = strcspn(line, "\r\n");
+        cui_log_append(&current->text_log, CUI_LOG_INFO, "发送  %.*s", (int)line_length, line);
+        line += line_length;
+        if (line[0] == '\r' && line[1] == '\n')
+        {
+            line++;
+        }
+        if (*line != '\0')
+        {
+            line++;
+        }
+    } while (*line != '\0');
     snprintf(current->status, sizeof current->status, "已连接 | %s，波特率 %s",
              current->port_names[current->port_index], current->baud_input);
     return true;
@@ -1536,10 +1887,30 @@ static void toggle_capture(serial_session *current)
     {
         int result = fclose(current->capture);
         current->capture = NULL;
+        current->capture_root[0] = L'\0';
         if (result != 0)
         {
-            snprintf(current->status, sizeof current->status, "记录已停止 | 写入文件失败");
+            report_session_error(current, "记录已停止 | 写入文件失败");
         }
+        return;
+    }
+    if (log_folder[0] != L'\0')
+    {
+        if (current->port_index < 0)
+        {
+            report_session_error(current, "记录失败 | 请先选择串口");
+            return;
+        }
+        wcscpy(current->capture_root, log_folder);
+        current->capture_archive = (log_archive){
+            .port_number = atoi(current->port_names[current->port_index] + 3),
+        };
+        current->capture_mode = CAPTURE_TEXT;
+        current->capture_after_cr = false;
+        current->capture_line_started = false;
+        SYSTEMTIME time;
+        GetLocalTime(&time);
+        update_daily_capture(current, &time);
         return;
     }
     WCHAR port_label[16] = L"串口";
@@ -1570,12 +1941,45 @@ static void toggle_capture(serial_session *current)
         current->capture = _wfsopen(path, L"wb", _SH_DENYWR);
         if (current->capture == NULL)
         {
-            snprintf(current->status, sizeof current->status, "记录失败 | 文件被占用或无法写入");
+            report_session_error(current, "记录失败 | 文件被占用或无法写入");
         }
         current->capture_mode = (capture_format)dialog.nFilterIndex;
         current->capture_after_cr = false;
         current->capture_line_started = false;
     }
+}
+
+static bool update_daily_capture(serial_session *current, const SYSTEMTIME *time)
+{
+    int previous_port = current->capture_archive.port_number;
+    int port = previous_port;
+    if (serial_is_open(&current->serial))
+    {
+        port = atoi(current->port_names[current->port_index] + 3);
+    }
+    log_archive_result result = log_archive_update(&current->capture_archive, &current->capture,
+                                                   current->capture_root, port, time);
+    if (result == LOG_ARCHIVE_OPENED)
+    {
+        current->capture_line_started = false;
+        /* 保留同一串口跨午夜拆开的 CRLF，换串口时重新识别行尾。 */
+        if (port != previous_port)
+        {
+            current->capture_after_cr = false;
+        }
+    }
+    if (result == LOG_ARCHIVE_ERROR)
+    {
+        if (current->capture != NULL)
+        {
+            fclose(current->capture);
+            current->capture = NULL;
+        }
+        current->capture_root[0] = L'\0';
+        report_session_error(current, "记录已停止 | 无法写入 COM%d 日志，请检查文件夹或文件占用", port);
+        return false;
+    }
+    return true;
 }
 
 static UINT_PTR CALLBACK capture_save_hook(HWND dialog, UINT message, WPARAM wparam, LPARAM lparam)
@@ -1595,6 +1999,10 @@ static UINT_PTR CALLBACK capture_save_hook(HWND dialog, UINT message, WPARAM wpa
 
 static const char *capture_label(const serial_session *current)
 {
+    if (current->capture_root[0] != L'\0')
+    {
+        return "正在按日期记录文本日志（.txt）";
+    }
     switch (current->capture_mode)
     {
     case CAPTURE_HEX:

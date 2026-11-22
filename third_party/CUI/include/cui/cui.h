@@ -626,6 +626,7 @@ typedef struct cui_input_opts {
     float height;              /* textarea: height in points; negative fills the space */
     const char *prefix;        /* muted text before the value, e.g. "$" or "https://" */
     const char *suffix;        /* muted text after the value, e.g. "USD" or "kg" */
+    bool enter_submits;         /* textarea: Enter submits, Shift+Enter inserts a newline */
 } cui_input_opts;
 
 /* Single line text field. Returns CUI_CHANGED / CUI_SUBMITTED (Enter) flags. */
@@ -3117,11 +3118,12 @@ CUI_API void cui_log_view_ex(cui_ctx *ui, const char *id, cui_log_buffer *buf, c
  * Drag to select, Ctrl+C copies the selection (or, with none, sets
  * r.interrupt), Ctrl+L clears, Up and Down walk the history and clicking the
  * output puts the keyboard in the input line. Only the rows in view are
- * drawn. Text is left to right, one cell per character. */
+ * drawn. Text is left to right, with two cells for wide East Asian characters. */
 typedef struct cui_terminal_line {
     uint32_t offset;           /* where the line's bytes start in the buffer's `text` */
     uint32_t len;              /* bytes of the line, with its color sequences */
     uint32_t cols;             /* character cells the line takes, before wrapping */
+    bool has_wide;             /* the line may need padding before a wrapped glyph */
 } cui_terminal_line;
 typedef struct cui_terminal_buffer {
     /* managed by cui_terminal_*; read it, do not write it */
@@ -3136,8 +3138,16 @@ typedef struct cui_terminal_buffer {
     uint8_t seq_n;             /* bytes of `seq` read so far */
     char seq[30];              /* the escape sequence being read, so a write can split one */
     bool cr;                   /* a \r was seen: the next character starts the line over */
+    int screen_rows, screen_row;
+    uint32_t caret_col;         /* zero-based terminal cell on the last transcript line */
+    bool cursor_hidden;
+    char utf8[4];               /* an incomplete character crossing output chunks */
+    uint8_t utf8_len, utf8_size;
 } cui_terminal_buffer;
 CUI_API void cui_terminal_init(cui_terminal_buffer *t, char *text, size_t text_cap, cui_terminal_line *lines, int line_cap);
+/* Track common cursor moves from a pseudoterminal in the scrolling transcript.
+ * Zero keeps the default line-stream behavior. */
+CUI_API void cui_terminal_set_screen_rows(cui_terminal_buffer *t, int rows);
 CUI_API void cui_terminal_write(cui_terminal_buffer *t, const char *data, int len);   /* len -1: up to the terminator */
 CUI_API void cui_terminal_printf(cui_terminal_buffer *t, const char *fmt, ...) CUI_PRINTF(2, 3);
 CUI_API void cui_terminal_clear(cui_terminal_buffer *t);
@@ -3148,10 +3158,13 @@ typedef struct cui_terminal_opts {
     float size;                /* font size, default 13 */
     const char *prompt;        /* default "$ " */
     bool no_input;             /* output only */
+    bool raw_input;            /* send input bytes instead of editing and echoing a local command */
 } cui_terminal_opts;
 typedef struct cui_terminal_result {
     const char *command;       /* the line entered (Enter), already echoed; valid this frame */
     bool interrupt;            /* Ctrl+C with nothing selected */
+    const char *input;         /* raw UTF-8 and VT input, valid this frame, never echoed */
+    int input_length;
 } cui_terminal_result;
 CUI_API cui_terminal_result cui_terminal_ex(cui_ctx *ui, const char *id, cui_terminal_buffer *t, const cui_terminal_opts *opts);
 
