@@ -504,8 +504,27 @@ static void cui__edit_follow_caret(cui__edit_frame *c, const cui__edit_result *r
     }
 }
 
+static bool cui__edit_history(cui__edit_frame *c, const cui_input_opts *o) {
+    cui_ctx *ui = c->ui;
+    cui_edit_state *e = c->e;
+    if (!o->history || c->read_only || ui->mods || e->cursor != e->anchor) return false;
+    bool previous = cui_key_pressed(ui, CUI_KEY_UP);
+    if (!previous && !cui_key_pressed(ui, CUI_KEY_DOWN)) return false;
+    if (c->multiline) {
+        int line = cui__line_of(c->lines, c->nlines, e->cursor);
+        if (previous ? line != 0 : line != c->nlines - 1) return false;
+    }
+    const char *text = o->history(o->history_user, previous, c->buf);
+    if (!text) return false;
+    cui__undo_push(ui, e, c->buf);
+    e->cursor = 0;
+    e->anchor = c->len;
+    cui__edit_replace_selection(c, text, (int)strlen(text), c->multiline);
+    return true;
+}
+
 static cui__edit_result cui__edit_logic(cui_ctx *ui, cui_id id, cui_edit_state *e, char *buf, size_t cap,
-                                        bool multiline, bool password, bool read_only, bool enter_submits, cui_rect area,
+                                        bool multiline, bool password, bool read_only, const cui_input_opts *o, cui_rect area,
                                         cui_font font, float size, float line_h, cui_interact r) {
     cui__edit_result res;
     memset(&res, 0, sizeof res);
@@ -545,10 +564,10 @@ static cui__edit_result cui__edit_logic(cui_ctx *ui, cui_id id, cui_edit_state *
 #endif
     c.prim = (mods & CUI_MOD_PRIMARY) != 0;
 
-    cui__edit_move_keys(&c);
+    if (!cui__edit_history(&c, o)) cui__edit_move_keys(&c);
     cui__edit_clipboard(&c);
     bool enter = cui_key_pressed(ui, CUI_KEY_ENTER);
-    res.submitted = enter && (!multiline || c.prim || (enter_submits && !c.shift));
+    res.submitted = enter && (!multiline || c.prim || (o->enter_submits && !c.shift));
     if (!read_only) cui__edit_typing(&c, &res, enter && !res.submitted);
     if (cui_key_pressed(ui, CUI_KEY_ESCAPE)) {
         if (e->cursor != e->anchor) e->anchor = e->cursor;
@@ -614,7 +633,7 @@ int cui__text_field(cui_ctx *ui, cui_id id, char *buf, size_t cap, const cui_inp
     cui_rect area = cui__prev_rect(ui, area_id);
     bool password = o->password && !e->show_password;
     cui__edit_result er = cui__edit_logic(ui, id, e, buf, cap, multiline, password, o->read_only || disabled,
-                                          o->enter_submits, area, font, size, line_h, rf);
+                                          o, area, font, size, line_h, rf);
     if (multiline && rf.hovered && ui->scroll_dy != 0 && area.h > 0) {
         /* wheel scrolls the text whether or not the field has focus */
         cui_text_layout_line *wl = NULL;

@@ -3,6 +3,7 @@
 #include <cui/cui_icons.h>
 
 #include "serial_port.h"
+#include "serial_control.h"
 #include "ssh_session.h"
 #include "favorites.h"
 #include "text_decode.h"
@@ -12,6 +13,7 @@
 #include <commdlg.h>
 #include <ctype.h>
 #include <dwmapi.h>
+#include <errno.h>
 #include <share.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -27,6 +29,8 @@
 
 #define MAX_SESSIONS 8
 #define LOG_FONT_CHOICES 4
+#define SEND_HISTORY_CAPACITY 32
+#define RX_LOG_PREFIX "接收  "
 
 typedef struct
 {
@@ -55,6 +59,7 @@ static const appearance themes[] = {
 static const wchar_t app_settings_key[] = L"Software\\STM32SerialConsole";
 static DWORD theme_index;
 static bool theme_save_failed;
+static bool ai_access_enabled;
 
 /* 数值对应保存对话框中文件类型的一基索引。 */
 typedef enum
@@ -72,6 +77,13 @@ typedef enum
 
 typedef struct
 {
+    char text[SERIAL_COMMAND_CAPACITY];
+    bool hex;
+    int ending_index;
+} send_history_entry;
+
+typedef struct
+{
     int id;
     session_kind kind;
     ssh_session ssh;
@@ -83,6 +95,11 @@ typedef struct
     int port_index;
     char baud_input[16];
     char tx_input[SERIAL_COMMAND_CAPACITY];
+    send_history_entry send_history[SEND_HISTORY_CAPACITY];
+    send_history_entry send_draft;
+    int send_history_next;
+    int send_history_count;
+    int send_history_offset;  /* 0 表示正在编辑草稿，正数表示距最新位置的距离。 */
     char status[192];
     bool status_error_pending;
     char access_error[128];
@@ -143,16 +160,21 @@ static const char *log_font_names[LOG_FONT_CHOICES] = {"Geist Mono"};
 static int log_font_count = 1;
 static int log_font_index;
 static double log_font_size = 16.0;
+static cui_color log_font_color;
+static bool log_font_color_dirty;
 static favorites saved;
 static wchar_t favorites_path[MAX_PATH];
 static int saved_session_index = -1;
 static int saved_command_index = -1;
 
 static void refresh_ports(serial_session *current);
+static bool serial_name_present(const char *name);
+static void poll_serial_control(void);
 static unsigned long parse_baud_rate(serial_session *current);
 static void toggle_connection(serial_session *current);
 static void poll_serial(serial_session *current);
 static void send_input(serial_session *current);
+static const char *recall_send_history(void *user, bool previous, const char *draft);
 static bool send_command(serial_session *current, const char *text, bool hex, int ending_index);
 static void toggle_capture(serial_session *current);
 static bool update_daily_capture(serial_session *current, const SYSTEMTIME *time);
@@ -203,7 +225,7 @@ static bool parse_hex(const char *input, unsigned char *output, size_t *length);
 static bool load_chinese_font(cui_ctx *ui);
 static cui_font load_system_font(cui_ctx *ui, const char *directory, const char *filename);
 
-int main(void)
+int main(int argc, char **argv)
 {
     DWORD preferred_theme;
     DWORD theme_size = sizeof preferred_theme;
@@ -218,6 +240,14 @@ int main(void)
                 break;
             }
         }
+    }
+    DWORD saved_log_color;
+    DWORD log_color_size = sizeof saved_log_color;
+    if (RegGetValueW(HKEY_CURRENT_USER, app_settings_key, L"LogFontColor", RRF_RT_REG_DWORD,
+                     NULL, &saved_log_color, &log_color_size) == ERROR_SUCCESS &&
+        saved_log_color <= 0xffffff)
+    {
+        log_font_color = CUI_RGB(saved_log_color);
     }
     DWORD folder_size = sizeof log_folder;
     RegGetValueW(HKEY_CURRENT_USER, app_settings_key, L"LogFolder", RRF_RT_REG_SZ | RRF_ZEROONFAILURE,
@@ -254,15 +284,48 @@ int main(void)
         snprintf(initial->status, sizeof initial->status, "%s",
                  favorites_path[0] ? "无法读取串口收藏文件" : "无法定位串口收藏文件");
     }
+    DWORD saved_ai_access = 0;
+    DWORD ai_access_size = sizeof saved_ai_access;
+    RegGetValueW(HKEY_CURRENT_USER, app_settings_key, L"AiAccess", RRF_RT_REG_DWORD,
+                 NULL, &saved_ai_access, &ai_access_size);
+    if (saved_ai_access == 1 || (argc > 1 && strcmp(argv[1], "--ai") == 0))
+    {
+        DWORD error = serial_control_start();
+        ai_access_enabled = error == ERROR_SUCCESS;
+        if (error != ERROR_SUCCESS)
+        {
+            report_session_error(initial, "无法启动 AI 控制接口（错误码 %lu）", (unsigned long)error);
+        }
+    }
     while (cui_app_frame(app))
     {
         poll_sessions();
+        if (ai_access_enabled)
+        {
+            poll_serial_control();
+        }
         cui_ctx *ui = cui_app_ui(app);
         DWORD previous_theme = theme_index;
         /* CUI 在帧开始时推进主题过渡，随后应用自定义色板。 */
         apply_theme_palette(ui, themes[theme_index].id);
         draw_workspace(ui);
         draw_log_recording_settings(app, ui);
+        if (log_font_color_dirty && !cui_mouse_down(ui, CUI_MOUSE_LEFT))
+        {
+            /* 拖动选色时实时预览，松开鼠标后再保存。 */
+            DWORD rgb = MAXDWORD;
+            if (log_font_color.a != 0)
+            {
+                rgb = ((DWORD)log_font_color.r << 16) | ((DWORD)log_font_color.g << 8) |
+                      log_font_color.b;
+            }
+            log_font_color_dirty = false;
+            if (RegSetKeyValueW(HKEY_CURRENT_USER, app_settings_key, L"LogFontColor",
+                               REG_DWORD, &rgb, sizeof rgb) != ERROR_SUCCESS)
+            {
+                cui_toast(ui, "无法保存日志字体颜色", .tone = CUI_TONE_DANGER);
+            }
+        }
         if (theme_index != previous_theme)
         {
             const appearance *theme = &themes[theme_index];
@@ -281,6 +344,7 @@ int main(void)
         /* CUI 空闲时也要处理串口完成事件，限制软件渲染时的轮询频率。 */
         Sleep(8);
     }
+    serial_control_close();
     for (int i = 0; i < tab_count; i++)
     {
         close_session(tabs[i]);
@@ -383,6 +447,269 @@ static void poll_sessions(void)
         {
             poll_ssh_session(current);
         }
+    }
+}
+
+static bool control_number(const char *text, uint64_t *value)
+{
+    if (*text == '\0' || strspn(text, "0123456789") != strlen(text))
+    {
+        return false;
+    }
+    errno = 0;
+    *value = strtoull(text, NULL, 10);
+    return errno != ERANGE;
+}
+
+static serial_session *control_find_session(uint64_t id)
+{
+    for (int i = 0; i < tab_count; i++)
+    {
+        if (tabs[i]->kind == SESSION_SERIAL && (uint64_t)tabs[i]->id == id)
+        {
+            return tabs[i];
+        }
+    }
+    return NULL;
+}
+
+static int control_port_index(const serial_session *session, const char *name)
+{
+    for (int i = 0; i < session->port_count; i++)
+    {
+        if (strcmp(session->port_names[i], name) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void control_connect(unsigned int port, unsigned int baud, char *reply)
+{
+    char name[16];
+    snprintf(name, sizeof name, "COM%u", port);
+    serial_session *session = NULL;
+    serial_session *empty = NULL;
+    for (int i = 0; i < tab_count; i++)
+    {
+        serial_session *candidate = tabs[i];
+        if (candidate->kind != SESSION_SERIAL)
+        {
+            continue;
+        }
+        int index = candidate->port_index;
+        if (index >= 0 && strcmp(candidate->port_names[index], name) == 0)
+        {
+            session = candidate;
+            if (serial_is_open(&candidate->serial))
+            {
+                break;
+            }
+        }
+        else if (!empty && index < 0 && candidate->text_log.total == 0 && !candidate->capture)
+        {
+            empty = candidate;
+        }
+    }
+    if (session && serial_is_open(&session->serial))
+    {
+        if (baud && parse_baud_rate(session) != baud)
+        {
+            snprintf(reply, SERIAL_CONTROL_REPLY_CAPACITY, "ERR %s is already open at %s baud\n",
+                     name, session->baud_input);
+            return;
+        }
+    }
+    else
+    {
+        if (!serial_name_present(name))
+        {
+            snprintf(reply, SERIAL_CONTROL_REPLY_CAPACITY, "ERR %s is not available\n", name);
+            return;
+        }
+        if (!session)
+        {
+            int previous_tab = selected_tab;
+            session = empty ? empty : create_session(SESSION_SERIAL);
+            selected_tab = previous_tab;
+        }
+        if (!session)
+        {
+            strcpy(reply, "ERR No free session tabs\n");
+            return;
+        }
+        refresh_ports(session);
+        session->port_index = control_port_index(session, name);
+        if (session->port_index < 0)
+        {
+            snprintf(reply, SERIAL_CONTROL_REPLY_CAPACITY, "ERR %s is not available\n", name);
+            return;
+        }
+        if (baud)
+        {
+            snprintf(session->baud_input, sizeof session->baud_input, "%u", baud);
+        }
+        toggle_connection(session);
+        if (!serial_is_open(&session->serial))
+        {
+            snprintf(reply, SERIAL_CONTROL_REPLY_CAPACITY, "ERR %s\n",
+                     session->access_error[0] ? session->access_error : session->status);
+            return;
+        }
+    }
+    snprintf(reply, SERIAL_CONTROL_REPLY_CAPACITY, "OK %d %llu\n", session->id,
+             (unsigned long long)session->text_log.total);
+}
+
+static void control_read_log(const serial_session *session, uint64_t cursor, char *reply)
+{
+    const cui_log_buffer *log = &session->text_log;
+    uint64_t oldest = log->total - (uint64_t)log->count;
+    if (cursor > log->total)
+    {
+        strcpy(reply, "ERR Cursor is ahead of the session log\n");
+        return;
+    }
+    bool gap = cursor < oldest;
+    uint64_t next = gap ? oldest : cursor;
+    /* 先预留响应头，确定实际读取到的游标后再写入。 */
+    enum { HEADER_CAPACITY = 64 };
+    size_t used = HEADER_CAPACITY;
+    size_t prefix_length = sizeof RX_LOG_PREFIX - 1;
+    for (; next < log->total; next++)
+    {
+        const char *text;
+        const cui_log_line *line = cui_log_get(log, (int)(next - oldest), &text);
+        if (!line || line->len < prefix_length || memcmp(text, RX_LOG_PREFIX, prefix_length) != 0)
+        {
+            continue;
+        }
+        size_t length = line->len - prefix_length;
+        if (length + 1 >= SERIAL_CONTROL_REPLY_CAPACITY - used)
+        {
+            break;
+        }
+        memcpy(reply + used, text + prefix_length, length);
+        used += length;
+        reply[used++] = '\n';
+    }
+    int header = snprintf(reply, HEADER_CAPACITY, "OK %d %llu %u\n", session->id,
+                          (unsigned long long)next, (unsigned int)gap);
+    if (header <= 0 || header >= HEADER_CAPACITY)
+    {
+        strcpy(reply, "ERR Cannot format log response\n");
+        return;
+    }
+    memmove(reply + header, reply + HEADER_CAPACITY, used - HEADER_CAPACITY);
+    reply[(size_t)header + used - HEADER_CAPACITY] = '\0';
+}
+
+static void control_command(char *request, char *reply)
+{
+    char *args[3] = {request};
+    size_t count = 1;
+    for (char *tab = strchr(request, '\t'); tab; tab = strchr(tab + 1, '\t'))
+    {
+        if (count == sizeof args / sizeof args[0])
+        {
+            strcpy(reply, "ERR Too many arguments\n");
+            return;
+        }
+        *tab = '\0';
+        args[count++] = tab + 1;
+    }
+    if (count == 1 && strcmp(args[0], "PORTS") == 0)
+    {
+        size_t used = 3;
+        strcpy(reply, "OK\n");
+        for (int i = 1; i <= SERIAL_MAX_PORT; i++)
+        {
+            char name[16];
+            snprintf(name, sizeof name, "COM%d", i);
+            if (serial_name_present(name))
+            {
+                size_t length = strlen(name);
+                memcpy(reply + used, name, length);
+                used += length;
+                reply[used++] = '\n';
+            }
+        }
+        reply[used] = '\0';
+        return;
+    }
+    uint64_t id, value;
+    if (count < 2 || !control_number(args[1], &id))
+    {
+        strcpy(reply, "ERR Invalid command or argument\n");
+        return;
+    }
+    if (strcmp(args[0], "CONNECT") == 0)
+    {
+        if (count != 3 || id == 0 || id > SERIAL_MAX_PORT ||
+            !control_number(args[2], &value) || value > SERIAL_MAX_BAUD)
+        {
+            strcpy(reply, "ERR Invalid port or baud rate\n");
+            return;
+        }
+        control_connect((unsigned int)id, (unsigned int)value, reply);
+        return;
+    }
+    serial_session *session = control_find_session(id);
+    if (!session)
+    {
+        strcpy(reply, "ERR Serial session not found\n");
+        return;
+    }
+    bool connected = serial_is_open(&session->serial) != FALSE;
+    if (count == 2 && strcmp(args[0], "STATUS") == 0)
+    {
+        snprintf(reply, SERIAL_CONTROL_REPLY_CAPACITY, "OK %d %s %llu\n%s\n", session->id,
+                 connected ? "connected" : "disconnected", (unsigned long long)session->text_log.total,
+                 session->access_error[0] ? session->access_error : session->status);
+    }
+    else if (count == 3 && strcmp(args[0], "READ") == 0 && control_number(args[2], &value))
+    {
+        control_read_log(session, value, reply);
+    }
+    else if (count == 2 && strcmp(args[0], "DISCONNECT") == 0)
+    {
+        if (connected)
+        {
+            toggle_connection(session);
+        }
+        strcpy(reply, "OK\n");
+    }
+    else if (count == 3 && strcmp(args[0], "SEND") == 0)
+    {
+        if (!connected || !args[2][0] || strlen(args[2]) >= SERIAL_COMMAND_CAPACITY ||
+            strspn(args[2], "0123456789ABCDEFabcdef") != strlen(args[2]) || strlen(args[2]) % 2 != 0)
+        {
+            strcpy(reply, "ERR Session disconnected or invalid payload\n");
+        }
+        else if (!send_command(session, args[2], true, 0))
+        {
+            snprintf(reply, SERIAL_CONTROL_REPLY_CAPACITY, "ERR %s\n", session->status);
+        }
+        else
+        {
+            strcpy(reply, "OK\n");
+        }
+    }
+    else
+    {
+        strcpy(reply, "ERR Invalid command or argument\n");
+    }
+}
+
+static void poll_serial_control(void)
+{
+    char request[SERIAL_CONTROL_REQUEST_CAPACITY];
+    if (serial_control_read(request))
+    {
+        char reply[SERIAL_CONTROL_REPLY_CAPACITY];
+        control_command(request, reply);
+        serial_control_reply(reply);
     }
 }
 
@@ -541,6 +868,40 @@ static void draw_app_settings(cui_ctx *ui)
         {
             log_folder_error = NULL;
             show_log_recording_settings = true;
+        }
+        if (cui_menu_item(ui, "AI 接入", .icon = CUI_ICON_LINK, .checked = ai_access_enabled))
+        {
+            DWORD error = ERROR_SUCCESS;
+            if (ai_access_enabled)
+            {
+                serial_control_close();
+                ai_access_enabled = false;
+            }
+            else
+            {
+                error = serial_control_start();
+                ai_access_enabled = error == ERROR_SUCCESS;
+            }
+            if (error != ERROR_SUCCESS)
+            {
+                char message[96];
+                snprintf(message, sizeof message, "无法开启 AI 接入（错误码 %lu）", (unsigned long)error);
+                cui_toast(ui, message, .tone = CUI_TONE_DANGER);
+            }
+            else
+            {
+                DWORD setting = ai_access_enabled ? 1 : 0;
+                LSTATUS saved = RegSetKeyValueW(HKEY_CURRENT_USER, app_settings_key, L"AiAccess",
+                                                REG_DWORD, &setting, sizeof setting);
+                if (saved != ERROR_SUCCESS)
+                {
+                    cui_toast(ui, "AI 接入已切换，但无法保存设置", .tone = CUI_TONE_DANGER);
+                }
+                else
+                {
+                    cui_toast(ui, ai_access_enabled ? "AI 接入已开启" : "AI 接入已关闭");
+                }
+            }
         }
     }
 }
@@ -987,8 +1348,9 @@ static void draw_session(serial_session *current, cui_ctx *ui)
             cui_log_view(ui, text_view ? "text-log" : "hex-log",
                          text_view ? &current->text_log : &current->hex_log,
                          .height = -1, .timestamps = true, .no_toolbar = !show_log_tools,
-                         .no_level_column = true, .info_color = theme->log_text,
-                         .copy_body_prefix = "接收  ",
+                         .no_level_column = true,
+                         .info_color = log_font_color.a ? log_font_color : theme->log_text,
+                         .copy_body_prefix = RX_LOG_PREFIX,
                          .size = (float)log_font_size, .font = log_fonts[log_font_index]);
         }
         cui_column(ui, .width = CUI_FILL, .gap = 6)
@@ -1003,12 +1365,13 @@ static void draw_session(serial_session *current, cui_ctx *ui)
                 bool can_send = connected && !serial_is_sending(&current->serial);
                 bool clicked = cui_button(ui, "发送", .variant = CUI_BUTTON_PRIMARY,
                                           .disabled = !can_send,
-                                          .tooltip = "回车发送，Shift+Enter 换行");
+                                          .tooltip = "回车发送，Shift+Enter 换行，↑↓ 查找历史命令");
                 int submitted = cui_textarea(ui, "send-input", current->tx_input,
                                              sizeof current->tx_input,
                                              .placeholder = current->tx_hex ? "例如 01 03 00 00" :
                                                                               "输入要发送的命令",
-                                             .width = CUI_FILL, .height = 80, .enter_submits = true);
+                                             .width = CUI_FILL, .height = 80, .enter_submits = true,
+                                             .history = recall_send_history, .history_user = current);
                 cui_column(ui, .width = CUI_PX(126), .gap = 6, .align = CUI_ALIGN_START)
                 {
                     cui_switch(ui, "十六进制", &current->tx_hex);
@@ -1304,6 +1667,25 @@ static void draw_log_settings(serial_session *current, cui_ctx *ui)
                    .label = "日志字体", .width = CUI_PX(164));
         cui_number(ui, "log-font-size", &log_font_size, 10, 32,
                    .label = "字号", .step = 1, .width = CUI_PX(164));
+        cui_column(ui, .gap = 6)
+        {
+            cui_text(ui, "日志颜色");
+            cui_row(ui, .gap = 8)
+            {
+                cui_color color = log_font_color.a ? log_font_color : themes[theme_index].log_text;
+                if (cui_color_picker(ui, "log-font-color", &color))
+                {
+                    log_font_color = color;
+                    log_font_color_dirty = true;
+                }
+                if (cui_button(ui, "恢复默认", .variant = CUI_BUTTON_GHOST,
+                               .disabled = log_font_color.a == 0))
+                {
+                    log_font_color = CUI_TRANSPARENT;
+                    log_font_color_dirty = true;
+                }
+            }
+        }
     }
 }
 
@@ -1369,7 +1751,6 @@ static void draw_favorites(serial_session *current, cui_ctx *ui, bool connected)
 static void refresh_ports(serial_session *current)
 {
     char previous[16] = "";
-    char target[1024];
     current->access_error[0] = '\0';
 
     if (current->port_index >= 0)
@@ -1381,7 +1762,7 @@ static void refresh_ports(serial_session *current)
     for (int number = 1; number <= SERIAL_MAX_PORT; number++)
     {
         snprintf(current->port_names[current->port_count], sizeof current->port_names[current->port_count], "COM%d", number);
-        if (QueryDosDeviceA(current->port_names[current->port_count], target, sizeof target))
+        if (serial_name_present(current->port_names[current->port_count]))
         {
             current->port_items[current->port_count] = current->port_names[current->port_count];
             if (strcmp(previous, current->port_names[current->port_count]) == 0)
@@ -1397,6 +1778,12 @@ static void refresh_ports(serial_session *current)
     }
     snprintf(current->status, sizeof current->status, "未连接%s",
              current->port_count == 0 ? " | 未找到串口" : "");
+}
+
+static bool serial_name_present(const char *name)
+{
+    char target[1024];
+    return QueryDosDeviceA(name, target, sizeof target) != 0;
 }
 
 static unsigned long parse_baud_rate(serial_session *current)
@@ -1713,7 +2100,7 @@ static void flush_text(serial_session *current, bool finish)
         return;
     }
 
-    static const char prefix[] = "接收  ";
+    static const char prefix[] = RX_LOG_PREFIX;
     char message[sizeof prefix - 1 + TEXT_DECODE_UTF8_CAPACITY];
     char *utf8 = message + sizeof prefix - 1;
     size_t used = text_decode_utf8(current->pending_text, current->pending_length,
@@ -1778,10 +2165,42 @@ static size_t format_hex_row(char *row, const unsigned char *data, size_t length
     return used;
 }
 
+static const char *recall_send_history(void *user, bool previous, const char *draft)
+{
+    serial_session *current = user;
+    int offset = current->send_history_offset + (previous ? 1 : -1);
+    if (offset < 0 || offset > current->send_history_count)
+    {
+        return NULL;
+    }
+    if (current->send_history_offset == 0)
+    {
+        snprintf(current->send_draft.text, sizeof current->send_draft.text, "%s", draft);
+        current->send_draft.hex = current->tx_hex;
+        current->send_draft.ending_index = current->ending_index;
+    }
+    current->send_history_offset = offset;
+    int index = (current->send_history_next + SEND_HISTORY_CAPACITY - offset) % SEND_HISTORY_CAPACITY;
+    const send_history_entry *entry = offset == 0 ? &current->send_draft : &current->send_history[index];
+    current->tx_hex = entry->hex;
+    current->ending_index = entry->ending_index;
+    return entry->text;
+}
+
 static void send_input(serial_session *current)
 {
     if (send_command(current, current->tx_input, current->tx_hex, current->ending_index))
     {
+        send_history_entry *entry = &current->send_history[current->send_history_next];
+        snprintf(entry->text, sizeof entry->text, "%s", current->tx_input);
+        entry->hex = current->tx_hex;
+        entry->ending_index = current->ending_index;
+        current->send_history_next = (current->send_history_next + 1) % SEND_HISTORY_CAPACITY;
+        if (current->send_history_count < SEND_HISTORY_CAPACITY)
+        {
+            current->send_history_count++;
+        }
+        current->send_history_offset = 0;
         current->tx_input[0] = '\0';
     }
 }

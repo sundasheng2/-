@@ -8,7 +8,7 @@ enable_language(RC)
 
 add_subdirectory(third_party/CUI EXCLUDE_FROM_ALL)
 add_executable(stm32_serial_console src/main.c src/serial_port.c src/favorites.c src/text_decode.c
-               src/serial_ansi.c src/ssh_session.c src/log_archive.c)
+               src/serial_ansi.c src/ssh_session.c src/log_archive.c src/serial_control.c)
 if(MINGW)
     # windres preprocessing cannot reliably pass non-ASCII absolute paths on Windows.
     set(app_icon_object "${CMAKE_CURRENT_BINARY_DIR}/app_icon.obj")
@@ -28,7 +28,7 @@ else()
     set_property(SOURCE src/app.rc APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src")
 endif()
 target_compile_features(stm32_serial_console PRIVATE c_std_11)
-target_link_libraries(stm32_serial_console PRIVATE cui::cui comdlg32)
+target_link_libraries(stm32_serial_console PRIVATE cui::cui comdlg32 advapi32)
 cui_app_target(stm32_serial_console)
 if(MSVC)
     target_compile_options(stm32_serial_console PRIVATE "$<$<COMPILE_LANGUAGE:C>:/utf-8;/W4>")

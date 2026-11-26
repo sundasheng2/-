@@ -627,6 +627,9 @@ typedef struct cui_input_opts {
     const char *prefix;        /* muted text before the value, e.g. "$" or "https://" */
     const char *suffix;        /* muted text after the value, e.g. "USD" or "kg" */
     bool enter_submits;         /* textarea: Enter submits, Shift+Enter inserts a newline */
+    /* Unmodified Up/Down at the first/last line. Return replacement text or NULL. */
+    const char *(*history)(void *user, bool previous, const char *draft);
+    void *history_user;
 } cui_input_opts;
 
 /* Single line text field. Returns CUI_CHANGED / CUI_SUBMITTED (Enter) flags. */
